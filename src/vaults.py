@@ -1,4 +1,7 @@
-from typing import Any
+import json
+import os
+from typing import Any, cast
+from urllib.request import Request, urlopen
 
 from utils import (
     APR_ORACLE_ADDRESS,
@@ -16,6 +19,28 @@ from utils import (
 
 KATANA_APR_API = "https://katana-apr-service.vercel.app/api/vaults"
 MULTICALL_BATCH_SIZE = 75
+KONG_GRAPHQL_URL = os.getenv("KONG_GRAPHQL_URL", "https://kong.yearn.fi/api/gql")
+KONG_TIMEOUT_SECONDS = 30
+KONG_VAULTS_QUERY = """
+query Vaults($chainId: Int!) {
+  vaults(chainId: $chainId, v3: true, yearn: true, vaultType: 1) {
+    chainId
+    address
+    name
+    tvl {
+      close
+    }
+    performance {
+      oracle {
+        apr
+      }
+    }
+    asset {
+      address
+    }
+  }
+}
+"""
 
 # Vault types
 MULTI_STRATEGY_TYPE = 1
@@ -45,6 +70,7 @@ CRYPTO_TOKENS = WETH_ADDRESSES | WBTC_ADDRESSES | {SKY, YYB}
 EXCLUDED_VAULTS = {
     "0x252b965400862d94BDa35FeCF7Ee0f204a53Cc36",
 }
+EXCLUDED_VAULTS_LOWER = {v.lower() for v in EXCLUDED_VAULTS}
 
 
 def fetch_katana_aprs() -> dict[str, float]:
@@ -64,7 +90,128 @@ def fetch_katana_aprs() -> dict[str, float]:
         return {}
 
 
-def get_data() -> dict[str, Any]:
+def _query_kong(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    if not KONG_GRAPHQL_URL:
+        raise RuntimeError("KONG_GRAPHQL_URL is empty")
+
+    request = Request(
+        KONG_GRAPHQL_URL,
+        data=json.dumps({"query": query, "variables": variables}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    with urlopen(request, timeout=KONG_TIMEOUT_SECONDS) as response:
+        payload: Any = json.loads(response.read().decode())
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Invalid Kong GraphQL payload")
+
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        messages = [str(err.get("message", "Unknown GraphQL error")) for err in errors if isinstance(err, dict)]
+        raise RuntimeError("; ".join(messages) or "Kong GraphQL query failed")
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("Kong GraphQL response missing data")
+
+    return data
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _get_data_from_kong() -> dict[str, Any]:
+    usd_vaults: list[dict[str, Any]] = []
+    crypto_vaults: list[dict[str, Any]] = []
+    katana_aprs = fetch_katana_aprs()
+    successful_chains = 0
+
+    for chain_name, chain_info in CHAINS.items():
+        chain_id = cast(int, chain_info["chain_id"])
+
+        try:
+            data = _query_kong(KONG_VAULTS_QUERY, {"chainId": chain_id})
+        except Exception:
+            continue
+
+        successful_chains += 1
+        raw_vaults = data.get("vaults", [])
+        if not isinstance(raw_vaults, list):
+            continue
+
+        for raw in raw_vaults:
+            if not isinstance(raw, dict):
+                continue
+
+            address_value = raw.get("address")
+            if not isinstance(address_value, str) or not address_value:
+                continue
+            address = address_value
+            address_lower = address.lower()
+
+            if address_lower in EXCLUDED_VAULTS_LOWER:
+                continue
+
+            name_value = raw.get("name")
+            if not isinstance(name_value, str) or not name_value:
+                continue
+            name = name_value
+
+            if "Liquid Locker Compounder" in name:
+                continue
+            if not any(x in name for x in ("yVault", "BOLD", "USDaf")):
+                continue
+
+            asset_address = ""
+            asset_data = raw.get("asset")
+            if isinstance(asset_data, dict):
+                asset_address_value = asset_data.get("address")
+                if isinstance(asset_address_value, str):
+                    asset_address = asset_address_value.lower()
+
+            apr_pct = 0.0
+            performance = raw.get("performance")
+            if isinstance(performance, dict):
+                oracle = performance.get("oracle")
+                if isinstance(oracle, dict):
+                    apr_pct = _to_float(oracle.get("apr")) * 100
+
+            if chain_name == "katana":
+                apr_pct = katana_aprs.get(address_lower, apr_pct)
+
+            tvl_usd = 0.0
+            tvl = raw.get("tvl")
+            if isinstance(tvl, dict):
+                tvl_usd = _to_float(tvl.get("close"))
+
+            vault = {
+                "name": name,
+                "chain": chain_name,
+                "chain_id": chain_id,
+                "address": address,
+                "apr": apr_pct,
+                "tvl_usd": tvl_usd,
+            }
+
+            if asset_address in CRYPTO_TOKENS:
+                crypto_vaults.append(vault)
+            else:
+                usd_vaults.append(vault)
+
+    if successful_chains == 0:
+        raise RuntimeError("Kong GraphQL query failed for all configured chains")
+
+    usd_vaults.sort(key=lambda x: x["apr"], reverse=True)
+    crypto_vaults.sort(key=lambda x: x["apr"], reverse=True)
+    return {"top_usd": usd_vaults[:5], "top_crypto": crypto_vaults[:5]}
+
+
+def _get_data_from_rpc() -> dict[str, Any]:
     """Fetch top V3 Multi Strategy vaults from on-chain registries."""
     usd_vaults: list[dict[str, Any]] = []
     crypto_vaults: list[dict[str, Any]] = []
@@ -229,3 +376,16 @@ def get_data() -> dict[str, Any]:
     crypto_vaults.sort(key=lambda x: x["apr"], reverse=True)
 
     return {"top_usd": usd_vaults[:5], "top_crypto": crypto_vaults[:5]}
+
+
+def get_data() -> dict[str, Any]:
+    """Fetch top V3 Multi Strategy vaults, preferring Kong GraphQL over direct RPC."""
+    try:
+        kong_data = _get_data_from_kong()
+        if kong_data["top_usd"] or kong_data["top_crypto"]:
+            return kong_data
+        print("Kong returned no vault data; falling back to direct RPC calls.")
+    except Exception as error:
+        print(f"Kong query failed ({error}); falling back to direct RPC calls.")
+
+    return _get_data_from_rpc()

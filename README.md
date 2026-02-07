@@ -29,13 +29,14 @@
 4. **Environment setup**
    ```bash
    cp .env.example .env
-   # Edit .env with your RPC URLs and Envio GraphQL endpoint
+   # Edit .env with your RPC URLs and GraphQL endpoints
 
    # Load environment variables into your shell session
    export $(grep -v '^#' .env | xargs)
    ```
 
    `ENVIO_GRAPHQL_URL` is used to query recent `StrategyChanged` events for the weekly update.
+   `KONG_GRAPHQL_URL` is used to fetch vault metadata/APR/TVL (defaults to `https://kong.yearn.fi/api/gql`).
 
 ## Usage
 
