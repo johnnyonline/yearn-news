@@ -1,7 +1,9 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import content
+import strategy_changes
 import tvl
 import vaults
 import ycrv
@@ -9,6 +11,23 @@ import yyb
 from utils import fmt_usd, get_week_and_year
 
 OUTPUT_FILE = Path(__file__).parent.parent / "output.md"
+MAX_STRATEGY_CHANGE_LINES = 10
+
+CHAIN_NAMES = {
+    1: "Ethereum",
+    137: "Polygon",
+    8453: "Base",
+    42161: "Arbitrum",
+    747474: "Katana",
+}
+
+CHAIN_EXPLORERS = {
+    1: "https://etherscan.io",
+    137: "https://polygonscan.com",
+    8453: "https://basescan.org",
+    42161: "https://arbiscan.io",
+    747474: "https://katanascan.com",
+}
 
 
 def render_overview(week: int, year: int) -> str:
@@ -101,6 +120,58 @@ def render_ycrv(data: dict[str, Any]) -> str:
     return "## yCRV" + text
 
 
+def _strategy_change_label(change_type: str) -> str:
+    return {"0": "Added", "1": "Revoked"}.get(change_type, "Changed")
+
+
+def _fmt_timestamp(ts: int | None) -> str:
+    if ts is None:
+        return "unknown time"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def render_strategy_changes(data: dict[str, Any]) -> str:
+    lines = ["## Strategy Changes"]
+    days = int(data.get("days", 7))
+    error = data.get("error")
+
+    if isinstance(error, str) and error:
+        lines.append(f"Could not fetch `StrategyChanged` events from Envio for the last {days} days.")
+        return "\n".join(lines)
+
+    events = data.get("events", [])
+    if not isinstance(events, list) or not events:
+        lines.append(f"No `StrategyChanged` events were indexed in the last {days} days.")
+        return "\n".join(lines)
+
+    lines.append(f"Recent `StrategyChanged` events (last {days} days):")
+    for event in events[:MAX_STRATEGY_CHANGE_LINES]:
+        if not isinstance(event, dict):
+            continue
+
+        strategy = str(event.get("strategy", ""))
+        change_type = _strategy_change_label(str(event.get("change_type", "")))
+        chain_id = event.get("chainId")
+        chain_name = CHAIN_NAMES.get(chain_id, f"Chain {chain_id}") if isinstance(chain_id, int) else "Unknown chain"
+        timestamp = _fmt_timestamp(event.get("blockTimestamp") if isinstance(event.get("blockTimestamp"), int) else None)
+        tx_hash = str(event.get("transactionHash", ""))
+        explorer = CHAIN_EXPLORERS.get(chain_id, "https://etherscan.io") if isinstance(chain_id, int) else None
+        tx_link = f" | [tx]({explorer}/tx/{tx_hash})" if tx_hash and explorer else ""
+
+        lines.append(f"- **{change_type}** strategy `{strategy}` on **{chain_name}** ({timestamp}){tx_link}")
+
+    if len(events) > MAX_STRATEGY_CHANGE_LINES:
+        remaining = len(events) - MAX_STRATEGY_CHANGE_LINES
+        lines.append(f"- ...and {remaining} more event(s).")
+
+    return "\n".join(lines)
+
+
+def has_strategy_changes_content(data: dict[str, Any]) -> bool:
+    events = data.get("events", [])
+    return isinstance(events, list) and len(events) > 0
+
+
 def render_yyb(data: dict[str, Any]) -> str:
     if data["wow_pct"] is None or data["prev_rewards_crvusd"] is None:
         return f"## yYB\nThis week yYB stakers received **{data['rewards_crvusd']:,.2f} crvUSD** rewards."
@@ -130,6 +201,7 @@ def generate() -> None:
 
     tvl_data = tvl.get_data()
     vaults_data = vaults.get_data()
+    strategy_changes_data = strategy_changes.get_data()
     ycrv_data = ycrv.get_data()
     yyb_data = yyb.get_data()
 
@@ -143,6 +215,9 @@ def generate() -> None:
         render_disclaimer(),
         render_sign_off(),
     ]
+
+    if has_strategy_changes_content(strategy_changes_data):
+        sections.insert(3, render_strategy_changes(strategy_changes_data))
 
     output = "\n\n".join(sections)
     OUTPUT_FILE.write_text(output)

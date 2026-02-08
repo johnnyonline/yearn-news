@@ -159,10 +159,20 @@ def get_web3(chain: str) -> Web3:
     return Web3(Web3.HTTPProvider(str(rpc)))
 
 
-def multicall(w3: Web3, calls: list[tuple[str, bytes]]) -> list[tuple[bool, bytes]]:
-    """Execute multiple calls via Multicall3. Returns list of (success, returnData)."""
+def multicall(w3: Web3, calls: list[tuple[str, bytes]], batch_size: int | None = None) -> list[tuple[bool, bytes]]:
+    """Execute calls via Multicall3. Returns list of (success, returnData)."""
     multicall_abi = load_abi("multicall3")
     multicall_contract = w3.eth.contract(address=Web3.to_checksum_address(MULTICALL3_ADDRESS), abi=multicall_abi)
     call_data = [(Web3.to_checksum_address(target), True, data) for target, data in calls]
-    results = multicall_contract.functions.aggregate3(call_data).call()
+
+    if not batch_size or len(call_data) <= batch_size:
+        results = multicall_contract.functions.aggregate3(call_data).call()
+        return [(r[0], r[1]) for r in results]
+
+    results = []
+    for i in range(0, len(call_data), batch_size):
+        chunk = call_data[i : i + batch_size]
+        chunk_results = multicall_contract.functions.aggregate3(chunk).call()
+        results.extend(chunk_results)
+
     return [(r[0], r[1]) for r in results]

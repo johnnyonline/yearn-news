@@ -16,6 +16,7 @@ This newsletter is meant to be a simple summary of recent activity: governance d
 Time seems to be moving faster than ever, but work at Yearn continues steadily. Our agenda for today:
 - **Yearn at a glance** - high-level protocol metrics, including TVL and week-over-week changes
 - **Vaults** - top yields across chains
+- **Strategy Changes** - any recent `StrategyChanged` events from indexed chains
 - **yCRV** - this week's fees and week-over-week changes
 - **yYB** - this week's fees and week-over-week changes
 - **Alpha Corner** - features and strategies in development

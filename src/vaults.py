@@ -15,6 +15,7 @@ from utils import (
 )
 
 KATANA_APR_API = "https://katana-apr-service.vercel.app/api/vaults"
+MULTICALL_BATCH_SIZE = 75
 
 # Vault types
 MULTI_STRATEGY_TYPE = 1
@@ -85,14 +86,18 @@ def get_data() -> dict[str, Any]:
             continue
 
         # Query all registries and collect vault addresses
-        vault_addresses = []
-        registry_for_vault = {}  # Track which registry each vault came from
-
-        for registry_addr in REGISTRY_ADDRESSES:
-            registry = w3.eth.contract(
+        vault_addresses: list[str] = []
+        registry_for_vault: dict[str, str] = {}  # Track which registry each vault came from
+        registry_contracts = {
+            registry_addr: w3.eth.contract(
                 address=w3.to_checksum_address(registry_addr),
                 abi=registry_abi,
             )
+            for registry_addr in REGISTRY_ADDRESSES
+        }
+
+        for registry_addr in REGISTRY_ADDRESSES:
+            registry = registry_contracts[registry_addr]
 
             try:
                 all_vaults = registry.functions.getAllEndorsedVaults().call()
@@ -118,10 +123,10 @@ def get_data() -> dict[str, Any]:
         for addr in vault_addresses:
             checksum_addr = w3.to_checksum_address(addr)
             reg_addr = registry_for_vault[addr]
-            registry = w3.eth.contract(address=w3.to_checksum_address(reg_addr), abi=registry_abi)
+            registry = registry_contracts[reg_addr]
             info_calls.append((reg_addr, registry.encode_abi("vaultInfo", args=[checksum_addr])))
 
-        info_results = multicall(w3, info_calls)
+        info_results = multicall(w3, info_calls, batch_size=MULTICALL_BATCH_SIZE)
 
         # Filter for Multi Strategy vaults only
         multi_strategy_vaults = []
@@ -154,7 +159,7 @@ def get_data() -> dict[str, Any]:
             if not is_katana:
                 calls.append((APR_ORACLE_ADDRESS, apr_oracle.encode_abi("getStrategyApr", args=[checksum_addr, 0])))
 
-        results = multicall(w3, calls)
+        results = multicall(w3, calls, batch_size=MULTICALL_BATCH_SIZE)
         calls_per_vault = 4 if is_katana else 5
 
         for i, addr in enumerate(multi_strategy_vaults):
